@@ -1,3 +1,5 @@
+import warnings
+
 import numpy as np
 import pandas as pd
 import torch
@@ -275,7 +277,7 @@ class Kronos(nn.Module, PyTorchModelHubMixin):
         s2_logits = self.head.cond_forward(x2)
         return s1_logits, s2_logits
 
-    def decode_s1(self, s1_ids, s2_ids, stamp=None, padding_mask=None):
+    def decode_s1(self, s1_ids, s2_ids, stamp=None, padding_mask=None, kv_cache=None, last_only=False):
         """
         Decodes only the s1 tokens.
 
@@ -287,10 +289,17 @@ class Kronos(nn.Module, PyTorchModelHubMixin):
             s2_ids (torch.Tensor): Input tensor of s2 token IDs. Shape: [batch_size, seq_len]
             stamp (torch.Tensor, optional): Temporal stamp tensor. Shape: [batch_size, seq_len]. Defaults to None.
             padding_mask (torch.Tensor, optional): Mask for padding tokens. Shape: [batch_size, seq_len]. Defaults to None.
+            kv_cache (KVCache, optional): Per-layer key/value cache for incremental decoding. When supplied,
+                                          `s1_ids`/`s2_ids` carry only the new tokens and attention also reads
+                                          the cached history. Defaults to None.
+            last_only (bool, optional): Project only the final position to logits. During generation the earlier
+                                        positions are discarded anyway, and skipping them avoids a vocabulary-sized
+                                        projection over the whole context. Defaults to False.
 
         Returns:
             Tuple[torch.Tensor, torch.Tensor]:
-                - s1 logits: Logits for s1 token predictions. Shape: [batch_size, seq_len, s1_vocab_size]
+                - s1 logits: Logits for s1 token predictions. Shape: [batch_size, seq_len, s1_vocab_size],
+                             or [batch_size, 1, s1_vocab_size] when `last_only` is set.
                 - context: Context representation from the Transformer. Shape: [batch_size, seq_len, d_model]
         """
         x = self.embedding([s1_ids, s2_ids])
@@ -299,15 +308,15 @@ class Kronos(nn.Module, PyTorchModelHubMixin):
             x = x + time_embedding
         x = self.token_drop(x)
 
-        for layer in self.transformer:
-            x = layer(x, key_padding_mask=padding_mask)
+        for i, layer in enumerate(self.transformer):
+            x = layer(x, key_padding_mask=padding_mask, layer_cache=None if kv_cache is None else kv_cache[i])
 
         x = self.norm(x)
 
-        s1_logits = self.head(x)
+        s1_logits = self.head(x[:, -1:, :] if last_only else x)
         return s1_logits, x
 
-    def decode_s2(self, context, s1_ids, padding_mask=None):
+    def decode_s2(self, context, s1_ids, padding_mask=None, last_only=False):
         """
         Decodes the s2 tokens, conditioned on the context and s1 tokens.
 
@@ -325,7 +334,7 @@ class Kronos(nn.Module, PyTorchModelHubMixin):
         """
         sibling_embed = self.embedding.emb_s1(s1_ids)
         x2 = self.dep_layer(context, sibling_embed, key_padding_mask=padding_mask)
-        return self.head.cond_forward(x2)
+        return self.head.cond_forward(x2[:, -1:, :] if last_only else x2)
 
 
 def top_k_top_p_filtering(
@@ -386,7 +395,33 @@ def sample_from_logits(logits, temperature=1.0, top_k=None, top_p=None, sample_l
     return x
 
 
-def auto_regressive_inference(tokenizer, model, x, x_stamp, y_stamp, max_context, pred_len, clip=5, T=1.0, top_k=0, top_p=0.99, sample_count=5, verbose=False):
+def auto_regressive_inference(tokenizer, model, x, x_stamp, y_stamp, max_context, pred_len, clip=5, T=1.0, top_k=0, top_p=0.99, sample_count=5, verbose=False, return_paths=False, use_cache=True):
+    """Autoregressively sample `sample_count` continuations for each input series.
+
+    Args:
+        return_paths (bool): Return every sampled path, shape [batch, sample_count, seq_len, features],
+                             instead of their mean. The mean discards the forecast distribution, which is
+                             what probability and dispersion estimates are built from.
+        use_cache (bool): Use the cached implementation, which computes the shared prefix once and reuses
+                          key/value state across steps. Set False for the reference implementation, which
+                          recomputes the full context on every step. Ignored when the context would overflow
+                          `max_context`, since the cached path is only exactly equivalent while no eviction
+                          occurs; see `cached_auto_regressive_inference`.
+    """
+    if use_cache and x.size(1) + pred_len > max_context:
+        warnings.warn(
+            f"context length {x.size(1)} + pred_len {pred_len} exceeds max_context {max_context}; "
+            "falling back to the uncached path, which is slower but is what the sliding window is defined "
+            f"against. Pass a context of at most {max_context - pred_len} bars to keep the cached path.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        use_cache = False
+    if use_cache:
+        return cached_auto_regressive_inference(
+            tokenizer, model, x, x_stamp, y_stamp, max_context, pred_len,
+            clip, T, top_k, top_p, sample_count, verbose, return_paths,
+        )
     with torch.no_grad():
         x = torch.clip(x, -clip, clip)
 
@@ -464,9 +499,110 @@ def auto_regressive_inference(tokenizer, model, x, x_stamp, y_stamp, max_context
         z = tokenizer.decode(input_tokens, half=True)
         z = z.reshape(-1, sample_count, z.size(1), z.size(2))
         preds = z.cpu().numpy()
-        preds = np.mean(preds, axis=1)
 
-        return preds
+        return preds if return_paths else np.mean(preds, axis=1)
+
+
+def cached_auto_regressive_inference(tokenizer, model, x, x_stamp, y_stamp, max_context, pred_len, clip=5, T=1.0, top_k=0, top_p=0.99, sample_count=5, verbose=False, return_paths=False):
+    """Cached equivalent of `auto_regressive_inference`.
+
+    The reference implementation re-runs the whole transformer stack over the
+    entire context on every generated step, and does so independently for each
+    sampling path, even though all paths share an identical prefix. Two changes
+    remove that redundancy:
+
+    1. The prefix is tokenized and encoded once at the series batch size, then
+       its key/value state is broadcast across sampling paths.
+    2. Each subsequent step feeds only the newly sampled token, attending to
+       cached history rather than recomputing it.
+
+    This path is only used when the whole generation fits inside `max_context`,
+    so the cache is append-only and its results are bitwise identical to the
+    reference implementation.
+
+    Eviction is deliberately not supported. Once the window slides, the reference
+    recomputes every context row against the shrunken window, whereas cached rows
+    retain the wider context they were first computed with. The final row agrees
+    either way, but the earlier rows feed `decode_s2` as cross-attention keys and
+    values, so the two paths would diverge. `auto_regressive_inference` guards
+    against this and falls back rather than returning near-enough numbers.
+    """
+    if x.size(1) + pred_len > max_context:
+        raise ValueError(
+            f"cached inference requires context + pred_len <= max_context, "
+            f"got {x.size(1)} + {pred_len} > {max_context}"
+        )
+    with torch.no_grad():
+        x = torch.clip(x, -clip, clip)
+        device = x.device
+        x_stamp = x_stamp.to(device)
+        y_stamp = y_stamp.to(device)
+
+        batch_size, initial_seq_len = x.size(0), x.size(1)
+        total_batch = batch_size * sample_count
+        total_seq_len = initial_seq_len + pred_len
+
+        # Encode once per series rather than once per sampling path.
+        x_token = tokenizer.encode(x, half=True)
+        full_stamp = torch.cat([x_stamp, y_stamp], dim=1)
+
+        prefix_start = max(0, initial_seq_len - max_context)
+        kv_cache = KVCache(len(model.transformer), max_context)
+        s1_logits, context = model.decode_s1(
+            x_token[0][:, prefix_start:initial_seq_len].contiguous(),
+            x_token[1][:, prefix_start:initial_seq_len].contiguous(),
+            full_stamp[:, prefix_start:initial_seq_len, :].contiguous(),
+            kv_cache=kv_cache,
+            last_only=True,
+        )
+
+        # Broadcast the shared prefix onto the sampling paths. repeat_interleave
+        # keeps each series' paths contiguous, matching the final reshape.
+        kv_cache.expand(sample_count)
+        context = context.repeat_interleave(sample_count, dim=0)
+        s1_logits = s1_logits.repeat_interleave(sample_count, dim=0)
+        full_stamp = full_stamp.repeat_interleave(sample_count, dim=0)
+
+        generated_pre = x_token[0].new_empty(total_batch, pred_len)
+        generated_post = x_token[1].new_empty(total_batch, pred_len)
+
+        ran = trange if verbose else range
+        for i in ran(pred_len):
+            sample_pre = sample_from_logits(s1_logits[:, -1, :], temperature=T, top_k=top_k, top_p=top_p, sample_logits=True)
+
+            # s2 conditions on the full context, so the context buffer is kept
+            # even though only its last row reaches the logits.
+            s2_logits = model.decode_s2(context, sample_pre, last_only=True)
+            sample_post = sample_from_logits(s2_logits[:, -1, :], temperature=T, top_k=top_k, top_p=top_p, sample_logits=True)
+
+            generated_pre[:, i] = sample_pre.squeeze(-1)
+            generated_post[:, i] = sample_post.squeeze(-1)
+
+            if i == pred_len - 1:
+                break
+
+            step = initial_seq_len + i
+            s1_logits, step_context = model.decode_s1(
+                sample_pre, sample_post,
+                full_stamp[:, step:step + 1, :].contiguous(),
+                kv_cache=kv_cache,
+                last_only=True,
+            )
+            context = torch.cat([context, step_context], dim=1)[:, -max_context:, :]
+
+        full_pre = torch.cat([x_token[0].repeat_interleave(sample_count, dim=0), generated_pre], dim=1)
+        full_post = torch.cat([x_token[1].repeat_interleave(sample_count, dim=0), generated_post], dim=1)
+
+        decode_start = max(0, total_seq_len - max_context)
+        z = tokenizer.decode(
+            [full_pre[:, decode_start:total_seq_len].contiguous(),
+             full_post[:, decode_start:total_seq_len].contiguous()],
+            half=True,
+        )
+        z = z.reshape(-1, sample_count, z.size(1), z.size(2))
+        preds = z.cpu().numpy()
+
+        return preds if return_paths else np.mean(preds, axis=1)
 
 
 def calc_time_stamps(x_timestamp):
@@ -502,22 +638,30 @@ class KronosPredictor:
         
         self.device = device
 
-        self.tokenizer = self.tokenizer.to(self.device)
-        self.model = self.model.to(self.device)
+        self.tokenizer = self.tokenizer.to(self.device).eval()
+        self.model = self.model.to(self.device).eval()
 
-    def generate(self, x, x_stamp, y_stamp, pred_len, T, top_k, top_p, sample_count, verbose):
+    def generate(self, x, x_stamp, y_stamp, pred_len, T, top_k, top_p, sample_count, verbose, return_paths=False, use_cache=True):
+        """Sample forecasts for a batch of normalized series.
 
+        Returns [batch, pred_len, features], or [batch, sample_count, pred_len, features]
+        when `return_paths` is set.
+        """
         x_tensor = torch.from_numpy(np.array(x).astype(np.float32)).to(self.device)
         x_stamp_tensor = torch.from_numpy(np.array(x_stamp).astype(np.float32)).to(self.device)
         y_stamp_tensor = torch.from_numpy(np.array(y_stamp).astype(np.float32)).to(self.device)
 
         preds = auto_regressive_inference(self.tokenizer, self.model, x_tensor, x_stamp_tensor, y_stamp_tensor, self.max_context, pred_len,
-                                          self.clip, T, top_k, top_p, sample_count, verbose)
-        preds = preds[:, -pred_len:, :]
-        return preds
+                                          self.clip, T, top_k, top_p, sample_count, verbose,
+                                          return_paths=return_paths, use_cache=use_cache)
+        return preds[..., -pred_len:, :]
 
-    def predict(self, df, x_timestamp, y_timestamp, pred_len, T=1.0, top_k=0, top_p=0.9, sample_count=1, verbose=True):
+    def _prepare_series(self, df, x_timestamp, y_timestamp):
+        """Validate one series and z-score it against its own lookback window.
 
+        Returns the batched model inputs plus the mean/std needed to invert the
+        normalization on the way out.
+        """
         if not isinstance(df, pd.DataFrame):
             raise ValueError("Input must be a pandas DataFrame.")
 
@@ -534,29 +678,48 @@ class KronosPredictor:
         if df[self.price_cols + [self.vol_col, self.amt_vol]].isnull().values.any():
             raise ValueError("Input DataFrame contains NaN values in price or volume columns.")
 
-        x_time_df = calc_time_stamps(x_timestamp)
-        y_time_df = calc_time_stamps(y_timestamp)
-
         x = df[self.price_cols + [self.vol_col, self.amt_vol]].values.astype(np.float32)
-        x_stamp = x_time_df.values.astype(np.float32)
-        y_stamp = y_time_df.values.astype(np.float32)
+        x_stamp = calc_time_stamps(x_timestamp).values.astype(np.float32)
+        y_stamp = calc_time_stamps(y_timestamp).values.astype(np.float32)
 
         x_mean, x_std = np.mean(x, axis=0), np.std(x, axis=0)
+        x = np.clip((x - x_mean) / (x_std + 1e-5), -self.clip, self.clip)
 
-        x = (x - x_mean) / (x_std + 1e-5)
-        x = np.clip(x, -self.clip, self.clip)
+        return x[np.newaxis, :], x_stamp[np.newaxis, :], y_stamp[np.newaxis, :], x_mean, x_std
 
-        x = x[np.newaxis, :]
-        x_stamp = x_stamp[np.newaxis, :]
-        y_stamp = y_stamp[np.newaxis, :]
+    @property
+    def feature_cols(self):
+        return self.price_cols + [self.vol_col, self.amt_vol]
+
+    def predict(self, df, x_timestamp, y_timestamp, pred_len, T=1.0, top_k=0, top_p=0.9, sample_count=1, verbose=True):
+        x, x_stamp, y_stamp, x_mean, x_std = self._prepare_series(df, x_timestamp, y_timestamp)
 
         preds = self.generate(x, x_stamp, y_stamp, pred_len, T, top_k, top_p, sample_count, verbose)
 
         preds = preds.squeeze(0)
         preds = preds * (x_std + 1e-5) + x_mean
 
-        pred_df = pd.DataFrame(preds, columns=self.price_cols + [self.vol_col, self.amt_vol], index=y_timestamp)
+        pred_df = pd.DataFrame(preds, columns=self.feature_cols, index=y_timestamp)
         return pred_df
+
+    def predict_paths(self, df, x_timestamp, y_timestamp, pred_len, T=1.0, top_k=0, top_p=0.9, sample_count=30, verbose=False):
+        """Forecast one series and return every sampled path, unaggregated.
+
+        `predict` averages the samples into a single expected path, which is the
+        right default for plotting but discards the forecast distribution. Any
+        use that needs a probability, a dispersion, or a quantile - risk sizing,
+        signal thresholds, calibration checks - needs the paths themselves.
+
+        Returns:
+            np.ndarray: Shape [sample_count, pred_len, len(self.feature_cols)],
+                        denormalized back to price/volume units.
+        """
+        x, x_stamp, y_stamp, x_mean, x_std = self._prepare_series(df, x_timestamp, y_timestamp)
+
+        paths = self.generate(x, x_stamp, y_stamp, pred_len, T, top_k, top_p, sample_count, verbose,
+                              return_paths=True)
+
+        return paths.squeeze(0) * (x_std + 1e-5) + x_mean
 
 
     def predict_batch(self, df_list, x_timestamp_list, y_timestamp_list, pred_len, T=1.0, top_k=0, top_p=0.9, sample_count=1, verbose=True):
