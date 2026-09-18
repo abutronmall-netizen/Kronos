@@ -291,7 +291,8 @@ class RotaryPositionalEmbedding(nn.Module):
         self.sin_cached = None
 
     def _update_cos_sin_cache(self, x, seq_len):
-        if seq_len != self.seq_len_cached:
+        if (self.seq_len_cached is None or seq_len > self.seq_len_cached
+                or self.cos_cached.device != x.device):
             self.seq_len_cached = seq_len
             t = torch.arange(seq_len, device=x.device).type_as(self.inv_freq)
             freqs = torch.einsum('i,j->ij', t, self.inv_freq)
@@ -300,8 +301,19 @@ class RotaryPositionalEmbedding(nn.Module):
             self.sin_cached = emb.sin()[None, None, :, :]
         return self.cos_cached, self.sin_cached
 
-    def forward(self, q, k):
-        cos, sin = self._update_cos_sin_cache(q, q.shape[-2])
+    def forward(self, q, k, offset=0):
+        """Rotate `q` and `k`, treating them as starting at absolute position `offset`.
+
+        `offset` is non-zero only during cached incremental decoding, where the
+        incoming tokens sit at positions [offset, offset + seq_len). RoPE encodes
+        position relatively - a score depends on i - j, not on i and j
+        individually - so a cache that evicts its oldest entries stays consistent
+        with recomputing a sliding window from position zero.
+        """
+        seq_len = q.shape[-2]
+        cos, sin = self._update_cos_sin_cache(q, offset + seq_len)
+        cos = cos[..., offset:offset + seq_len, :]
+        sin = sin[..., offset:offset + seq_len, :]
         return (
             (q * cos) + (self._rotate_half(q) * sin),
             (k * cos) + (self._rotate_half(k) * sin),
@@ -310,6 +322,70 @@ class RotaryPositionalEmbedding(nn.Module):
     def _rotate_half(self, x):
         x1, x2 = x.chunk(2, dim=-1)
         return torch.cat((-x2, x1), dim=-1)
+
+
+class LayerKVCache:
+    """Key/value cache for one self-attention layer during incremental decoding.
+
+    Entries are evicted oldest-first once `max_len` is reached, which reproduces
+    the sliding context window that the uncached generation loop recomputes from
+    scratch on every step.
+    """
+
+    def __init__(self, max_len):
+        self.max_len = max_len
+        self.k = None
+        self.v = None
+        self.seen = 0
+
+    @property
+    def offset(self):
+        """Absolute position of the next token to be appended."""
+        return self.seen
+
+    def append(self, k, v):
+        """Add this step's keys/values and return the full attendable history."""
+        self.seen += k.shape[-2]
+        if self.k is None:
+            self.k, self.v = k, v
+        else:
+            self.k = torch.cat([self.k, k], dim=-2)
+            self.v = torch.cat([self.v, v], dim=-2)
+        if self.k.shape[-2] > self.max_len:
+            self.k = self.k[..., -self.max_len:, :]
+            self.v = self.v[..., -self.max_len:, :]
+        return self.k, self.v
+
+    def expand(self, repeats):
+        """Repeat each batch entry `repeats` times, in place.
+
+        Used to broadcast a prefix computed once onto many sampling paths. The
+        interleaved ordering matches how callers lay out `batch * sample_count`.
+        """
+        if self.k is not None:
+            self.k = self.k.repeat_interleave(repeats, dim=0)
+            self.v = self.v.repeat_interleave(repeats, dim=0)
+
+
+class KVCache:
+    """Per-layer key/value caches for a stack of transformer blocks."""
+
+    def __init__(self, n_layers, max_len):
+        self.layers = [LayerKVCache(max_len) for _ in range(n_layers)]
+
+    def __getitem__(self, idx):
+        return self.layers[idx]
+
+    def __len__(self):
+        return len(self.layers)
+
+    @property
+    def offset(self):
+        return self.layers[0].offset
+
+    def expand(self, repeats):
+        for layer in self.layers:
+            layer.expand(repeats)
 
 
 class MultiHeadAttentionWithRoPE(nn.Module):
@@ -327,26 +403,40 @@ class MultiHeadAttentionWithRoPE(nn.Module):
         self.attn_dropout_p = attn_dropout_p
         self.resid_dropout = nn.Dropout(resid_dropout_p)
 
-    def forward(self, x, key_padding_mask=None):
+    def forward(self, x, key_padding_mask=None, layer_cache=None):
         batch_size, seq_len, _ = x.shape
+        offset = layer_cache.offset if layer_cache is not None else 0
 
         q = self.q_proj(x).view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
         k = self.k_proj(x).view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(x).view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
 
-        q, k = self.rotary(q, k)
+        q, k = self.rotary(q, k, offset=offset)
+
+        if layer_cache is not None:
+            k, v = layer_cache.append(k, v)
+        key_len = k.shape[-2]
 
         if key_padding_mask is not None:
-            attn_mask = key_padding_mask.unsqueeze(1).unsqueeze(2)  # [batch, 1, 1, seq_len]
+            attn_mask = key_padding_mask.unsqueeze(1).unsqueeze(2)  # [batch, 1, 1, key_len]
             attn_mask = attn_mask.expand(-1, self.n_heads, seq_len, -1)  # [batch, n_heads, q_len, k_len]
         else:
             attn_mask = None
+
+        # scaled_dot_product_attention anchors its causal mask to the top-left
+        # corner, so the flag is only meaningful when query and key lengths
+        # match. Once the cache holds earlier tokens every cached key is already
+        # strictly in the past for the incoming query, so no mask is needed.
+        if seq_len != key_len and seq_len != 1:
+            raise ValueError(
+                f"cached attention expects a single-token query, got q_len={seq_len}, k_len={key_len}"
+            )
 
         attn_output = F.scaled_dot_product_attention(
             q, k, v,
             attn_mask=attn_mask,
             dropout_p=self.attn_dropout_p if self.training else 0.0,
-            is_causal=True
+            is_causal=seq_len == key_len
         )
 
         attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, self.d_model)
@@ -470,10 +560,10 @@ class TransformerBlock(nn.Module):
         self.norm2 = RMSNorm(d_model)
         self.ffn = FeedForward(d_model, ff_dim, ffn_dropout_p)
 
-    def forward(self, x, key_padding_mask=None):
+    def forward(self, x, key_padding_mask=None, layer_cache=None):
         residual = x
         x = self.norm1(x)
-        attn_out = self.self_attn(x, key_padding_mask=key_padding_mask)
+        attn_out = self.self_attn(x, key_padding_mask=key_padding_mask, layer_cache=layer_cache)
         x = residual + attn_out
 
         residual = x
